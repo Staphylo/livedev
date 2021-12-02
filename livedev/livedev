@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+
+"""
+livedev is a tool developed to synchronize local and remove sources.
+It is intended for easy development in a familiar environment while being able
+to test production code on the targeted device.
+
+It relies on inotify on the host machine and sends data to the remote via ssh/scp
+
+It is mandatory to have password-less authentication to the target device
+ - ssh-copy-id && ssh-add
+ - ssh control socket with an established session
+
+This tool can synchronise a local file or folder to one or multiple
+destinations
+This program also has a startup option to synchronize all source code to the
+target.
+Normal operation will only upload modified files.
+"""
+
+import argparse
+import concurrent.futures
+import fnmatch
+import glob
+import inspect
+import os
+import subprocess
+import sys
+import threading
+
+import inotify.adapters
+
+def parse_args(args):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('-d', '--dry-run', action='store_true')
+    parser.add_argument('-i', '--init', action='store_true')
+    parser.add_argument('-w', '--workers', default=4, type=int,
+        help='number of worker to update remote hosts')
+    parser.add_argument('-p', '--paths', action='append',
+        help='path to monitor')
+    parser.add_argument('remotes', nargs='+',
+        help='remote hosts and paths to use')
+    parser.add_argument('-v', '--verbose', action='store_true')
+    return parser.parse_args(args)
+
+def match_events(events, expected):
+    for event in events:
+        if event in expected:
+            return True
+    return False
+
+def parse_checksum_output(output, relative=None):
+    data = {}
+    for line in output.splitlines():
+        checksum, fname = line.split(None, 1)
+        if relative:
+            fname = os.path.relpath(fname, relative)
+        data[fname] = checksum
+    return data
+
+class Remote(object):
+    def __init__(self, host, workers=1, verbose=False):
+        # host, path = rpath.split(':', 1)
+        # self.rpath = rpath
+        self.host = host
+        # self.path = path
+        self.workers = workers
+        self.verbose = verbose
+        self.manager = None
+
+    def __str__(self):
+        return self.host
+
+    def log(self, fmt, *args):
+        if self.verbose:
+            print(fmt % args)
+
+    def checksum_files(self, path, files):
+        if not files:
+            return {}
+        cmd = [ 'sha1sum' ] + [os.path.join(path, f) for f in files]
+        res = self.ssh(cmd, capture=True)
+        return parse_checksum_output(res.stdout.decode('utf-8'), relative=path)
+
+    def checksum_tree(self, path):
+        cmd = [ 'find', path, '-type', 'f', '-exec', 'sha1sum', '{}', '+' ]
+        res = self.ssh(cmd, capture=True)
+        return parse_checksum_output(res.stdout.decode('utf-8'), relative=path)
+
+    def is_dry_run(self):
+        frame = inspect.stack()[2].frame
+        parent = frame.f_locals.get('self', None)
+        return self.manager.dry_run and isinstance(parent, Action)
+
+    def ssh(self, rcmd, capture=False):
+        kwargs = { 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL }
+        if capture:
+            kwargs = { 'capture_output': True }
+
+        cmd = [
+            'ssh',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            self.host,
+        ] + rcmd
+        self.log(' '.join(cmd))
+        if not self.is_dry_run():
+            return subprocess.run(cmd, **kwargs)
+
+    def scp_files(self, rpath, files):
+        cmd = [
+            'scp',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+        ] + files + [
+            '%s:%s' % (self.host, rpath)
+        ]
+        self.log(' '.join(cmd))
+        if not self.is_dry_run():
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def run_actions(self, actions):
+        if self.workers > 1:
+            # sshd_config default MaxSession 10
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as p:
+                p.map(lambda a: a.run(self), actions)
+        else:
+            for action in actions:
+                action.run(self)
+
+class RemoteManager(object):
+    def __init__(self, remotes, dry_run):
+        self.remotes = remotes
+        self.dry_run = dry_run
+        for remote in remotes:
+            remote.manager = self
+
+    def run(self, func):
+        threads = []
+        for remote in self.remotes:
+            thread = threading.Thread(
+                target=lambda r: func(r),
+                args=(remote,),
+            )
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+class Action(object):
+    NAME = None
+    def __init__(self, path, relpath, fname, type_names):
+        self.path = path
+        self.lpath = os.path.join(path.path, relpath)
+        self.relpath = relpath
+        self.fname = fname
+        self.type_names = type_names
+
+    def log(self, remote, fmt, *args):
+        info = fmt % args
+        print('%s(%s): %s: %s' % (remote.host, self.path, self.NAME, info))
+
+    def run(self, remote):
+        print('Doing nothing for %s on %s' % (os.path.join(self.lpath, self.fname),
+                                                          self.type_names))
+
+class CreateAction(Action):
+    NAME = 'create'
+    def run(self, remote):
+        self.log(remote, '%s', os.path.join(self.relpath, self.fname))
+        rpath = os.path.join(self.path.rpath, self.relpath)
+        remote.ssh(['mkdir', '-p', rpath])
+        remote.scp_files(rpath, [os.path.join(self.lpath, self.fname)])
+
+class ModifyAction(CreateAction):
+    NAME = 'modify'
+    def run(self, remote):
+        self.log(remote, '%s', os.path.join(self.relpath, self.fname))
+        rpath = os.path.join(self.path.rpath, self.relpath)
+        remote.scp_files(rpath, [os.path.join(self.lpath, self.fname)])
+
+class DeleteAction(Action):
+    NAME = 'remove'
+    def run(self, remote):
+        fpath = os.path.join(self.path.rpath, self.relpath, self.fname)
+        self.log(remote, '%s', os.path.join(self.relpath, self.fname))
+        remote.ssh(['rm', '-f', fpath])
+
+def filter_path(path):
+    if '__pycache__' in path:
+        return False
+    if path.endswith(('.pyc', '~', '.swp')):
+        return False
+    return True
+
+def filter_files(files):
+    return [ f for f in files if filter_path(f) ]
+
+def actions_for_paths(path, rsums):
+    seen = set()
+    unseen = set()
+    actions = []
+
+    def _action_args(name):
+        fpath, fname = os.path.split(name)
+        # return (os.path.join(path.path, fpath), path.rpath, fpath, fname, None)
+        return (path, fpath, fname, None)
+
+    for name, lsum in path.checksums.items():
+        if not path.filter(name):
+            continue
+        rsum = rsums.get(name)
+        if rsum is None:
+            unseen.add(name)
+            continue
+        seen.add(name)
+        if lsum != rsum:
+            actions.append(ModifyAction(*_action_args(name)))
+
+    for name in unseen:
+        actions.append(CreateAction(*_action_args(name)))
+
+    if path.flags & path.FLAG_REMOVE:
+        for name in set(rsums) - seen:
+            actions.append(DeleteAction(*_action_args(name)))
+
+    return actions
+
+def filter_checksums(checksums):
+    return { n : c for n, c in checksums.items() if filter_path(n) }
+
+def init_remote(remote, paths):
+    # NOTE: process could be improved by
+    #  - rsync: though it might not be available
+    ractions = []
+    for path in paths:
+        if path.flags & path.FLAG_REMOVE:
+            rsums = filter_checksums(remote.checksum_tree(path.remote))
+        else:
+            rsums = filter_checksums(remote.checksum_files(path.remote, path.checksums.keys()))
+        actions = actions_for_paths(path, rsums)
+        print('%s: %d operations to perform for %s' % (remote.host, len(actions), path))
+        ractions.extend(actions)
+    print('%s: total %d operations to perform' % (remote.host, len(ractions)))
+    remote.run_actions(ractions)
+    print('%s: initialization complete' % remote.host)
+
+def run(rmanager, paths):
+    print('monitoring %d paths' % len(paths))
+
+    actionMap = {
+        'IN_CREATE': CreateAction,
+        'IN_MODIFY': ModifyAction,
+        'IN_DELETE': DeleteAction,
+    }
+
+    def _path_for(fpath):
+        for path in paths:
+            # TODO: assert on nested monitored paths
+            if fpath.startswith(path.path):
+                return path
+        raise RuntimeError('%s does not match a monitored path' % fpath)
+
+    i = inotify.adapters.InotifyTrees([p.path for p in paths])
+
+    while True:
+        actions = {}
+        for event in i.event_gen(timeout_s=0.2, yield_nones=False):
+            (_, type_names, fpath, fname) = event
+            if fname.isdigit() or fname.endswith('~'): # TODO: proper event filter
+                continue
+            for tname in type_names:
+                cls = actionMap.get(tname)
+                if cls is not None:
+                    path = _path_for(fpath)
+                    relpath = os.path.relpath(fpath, path.path)
+                    if path.filter(os.path.join(relpath, fname)):
+                        # NOTE: some action might be overriden here
+                        actions[(relpath, fname)] = cls(path, relpath, fname, type_names)
+
+        if actions:
+            rmanager.run(lambda remote: remote.run_actions(actions.values()))
+
+class PathWatch(object):
+
+    FLAG_REMOVE = 0x01
+    FLAG_MAP = {
+        'r': FLAG_REMOVE,
+    }
+
+    def __init__(self, local, remote, flags):
+        self.name = local
+        self.local = os.path.abspath(local)
+        self.remote = remote
+        self.path = self.local
+        self.rpath = self.remote
+        self.flags = flags
+        self.checksums = None
+
+    def __str__(self):
+        return self.name
+
+    def filter(self, fname):
+        return True
+
+    def compute_checksums(self):
+        self.checksums = filter_checksums(self.checksum_tree())
+
+    def checksum_cmd(self, cmd):
+        res = subprocess.run(cmd, capture_output=True)
+        return parse_checksum_output(res.stdout.decode('utf-8'), relative=self.path)
+
+    def checksum_tree(self):
+        cmd = [ 'find', self.path, '-type', 'f', '-exec', 'sha1sum', '{}', '+' ]
+        return self.checksum_cmd(cmd)
+
+    @classmethod
+    def str2flags(cls, s):
+        flag = 0
+        for c in s:
+            v = cls.FLAG_MAP.get(c)
+            if v is not None:
+                flag |= v
+        return flag
+
+class FileWatch(PathWatch):
+    def __init__(self, local, remote, flags):
+        super(FileWatch, self).__init__(local, remote, flags)
+        self.path, self.fname = os.path.split(self.local)
+        self.rpath, self.rname = os.path.split(self.remote)
+        assert self.fname == self.rname
+
+    def filter(self, fname):
+        return fname == self.fname
+
+    def checksum_tree(self):
+        cmd = ['sha1sum', self.fname]
+        return self.checksum_cmd(cmd)
+
+class GlobWatch(PathWatch):
+    def __init__(self, local, remote, flags):
+        super(GlobWatch, self).__init__(local, remote, flags)
+        self.path, self.fname = os.path.split(self.local)
+
+    def filter(self, fname):
+        return fnmatch.fnmatch(fname, self.fname)
+
+    def checksum_tree(self):
+        files = glob.glob(self.local)
+        if not files:
+            return {}
+        cmd = ['sha1sum'] + files
+        return self.checksum_cmd(cmd)
+
+def parse_paths(paths):
+    pws = []
+    for path in paths:
+        items = path.split(':')
+        if len(items) == 3:
+            local, remote, flags = items
+            flags = PathWatch.str2flags(flags)
+        else:
+            local, remote = items
+            flags = PathWatch.str2flags('')
+        if not os.path.exists(local):
+            pw = GlobWatch(local, remote, flags)
+            if not os.path.exists(pw.path):
+                return None
+            pws.append(pw)
+        elif os.path.isfile(local):
+            pws.append(FileWatch(local, remote, flags))
+        else:
+            pws.append(PathWatch(local, remote, flags))
+    return pws
+
+def init(rmanager, paths):
+    for path in paths:
+        print('init: computing checksums for %s' % path)
+        path.compute_checksums()
+    rmanager.run(lambda remote: init_remote(remote, paths))
+
+def main(args):
+    args = parse_args(args)
+
+    paths = parse_paths(args.paths)
+    if not paths:
+        print('Please provide valid paths to monitor')
+        return
+    remotes = [Remote(remote, workers=args.workers, verbose=args.verbose) for remote in args.remotes]
+    rmanager = RemoteManager(remotes, dry_run=args.dry_run)
+
+    if args.init:
+        init(rmanager, paths)
+
+    try:
+        run(rmanager, paths)
+    except KeyboardInterrupt:
+        print('session terminated by user')
+        if args.verbose:
+            raise
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
