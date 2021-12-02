@@ -1,0 +1,12 @@
+# dev
+*~
+*.bkp
+
+# python
+/build
+/dist
+/*.egg-info
+/.eggs
+*.pyc
+__pycache__
+/venv*
