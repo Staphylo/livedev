@@ -44,6 +44,7 @@ def parse_args(args):
     parser.add_argument('remotes', nargs='+',
         help='remote hosts and paths to use')
     parser.add_argument('-v', '--verbose', action='store_true')
+    parser.add_argument('-s', '--ssh-copy-id', action='store_true')
     return parser.parse_args(args)
 
 def match_events(events, expected):
@@ -62,14 +63,18 @@ def parse_checksum_output(output, relative=None):
     return data
 
 class Remote(object):
-    def __init__(self, host, workers=1, verbose=False):
+    def __init__(self, host, workers=1, verbose=False, ssh_copy_id=False):
         # host, path = rpath.split(':', 1)
         # self.rpath = rpath
         self.host = host
         # self.path = path
         self.workers = workers
         self.verbose = verbose
+        self.ssh_copy_id = ssh_copy_id
         self.manager = None
+
+        if self.ssh_copy_id:
+           self.copy_ssh_id()
 
     def __str__(self):
         return self.host
@@ -130,6 +135,15 @@ class Remote(object):
         else:
             for action in actions:
                 action.run(self)
+
+    def create_ssh_id_if_not_exists(self):
+        cmd = 'ssh-keygen -t rsa -b 2048 -P "" -f ~/.ssh/id_rsa <<< n'
+        subprocess.run(cmd, shell=True)
+
+    def copy_ssh_id(self):
+        self.create_ssh_id_if_not_exists()
+        cmd = 'ssh-copy-id -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_rsa.pub -f '+self.host
+        subprocess.run(cmd, shell=True)
 
 class RemoteManager(object):
     def __init__(self, remotes, dry_run):
@@ -389,7 +403,9 @@ def main(args):
     if not paths:
         print('Please provide valid paths to monitor')
         return
-    remotes = [Remote(remote, workers=args.workers, verbose=args.verbose) for remote in args.remotes]
+    remotes = [Remote(remote, workers=args.workers,
+                      verbose=args.verbose, ssh_copy_id=args.ssh_copy_id)
+               for remote in args.remotes]
     rmanager = RemoteManager(remotes, dry_run=args.dry_run)
 
     if args.init:
